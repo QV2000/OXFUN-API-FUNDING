@@ -242,7 +242,7 @@ class OxHourlyCollector:
         conn.commit()
         conn.close()
     
-    def fetch_latest_candle(self, market_code, timeframe='1h'):
+    def fetch_latest_candle(self, market_code, timeframe='3600s'):
         """Fetch only the latest candle for a market and timeframe"""
         url = f'https://api.ox.fun/v3/candles?marketCode={market_code}&timeframe={timeframe}&limit=1'
         
@@ -416,7 +416,7 @@ class OxHourlyCollector:
         consolidated_candles.to_csv(candles_consolidated, index=False)
         logger.info(f"Updated consolidated candles file with {len(candles_df)} new records")
     
-    def collect_data(self, timeframe='1h'):
+    def collect_data(self, timeframe='3600s'):
         """Collect latest data for all markets"""
         collection_time = datetime.now()
         logger.info(f"Starting data collection at {collection_time}")
@@ -473,7 +473,7 @@ if __name__ == "__main__":
         exit(1)
     
     collector = OxHourlyCollector()
-    results = collector.collect_data(timeframe='1h')
+    results = collector.collect_data(timeframe='3600s')
     
     logger.info("Collection Summary:")
     logger.info(f"Collection time: {results['collection_time']}")
