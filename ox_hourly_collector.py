@@ -4,7 +4,6 @@ import pandas as pd
 from datetime import datetime
 import os
 import sqlite3
-import json
 import logging
 
 # Configure logging
@@ -13,23 +12,23 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("ox_hourly_collector.log")
+        logging.FileHandler("ox_funding_collector.log")
     ]
 )
-logger = logging.getLogger("ox_hourly_collector")
+logger = logging.getLogger("ox_funding_collector")
 
-# API credentials
+# API credentials - for GitHub Actions, these should be set as repository secrets
 API_KEY = os.environ.get("OX_API_KEY", "your_api_key")
 SECRET_KEY = os.environ.get("OX_SECRET_KEY", "your_secret_key")
 
 # Define output directories
 DATA_DIR = os.environ.get("DATA_DIR", "data")
-DB_PATH = os.path.join(DATA_DIR, "ox_hourly_data.db")
+DB_PATH = os.path.join(DATA_DIR, "ox_funding_data.db")
 
 # Create data directory if it doesn't exist
 os.makedirs(DATA_DIR, exist_ok=True)
 
-class OxHourlyCollector:
+class OxFundingCollector:
     def __init__(self, api_key=API_KEY, secret_key=SECRET_KEY, db_path=DB_PATH):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -41,24 +40,21 @@ class OxHourlyCollector:
         }
         
         self.base_delay = 1.0
-        self.rate_limit_delay = 60
-        self.max_retries = 5
+        self.max_retries = 3
         
         # Initialize database
         self.init_database()
     
     def init_database(self):
-        """Initialize SQLite database with necessary tables"""
+        """Initialize SQLite database with funding rates table"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Funding rates table
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS funding_rates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             market_code TEXT,
             funding_rate REAL,
-            mark_price REAL,
             created_at TEXT,
             timestamp DATETIME,
             collection_time DATETIME,
@@ -84,9 +80,9 @@ class OxHourlyCollector:
             
             if response.status_code == 200:
                 return response.json()
-            elif response.status_code == 429:
-                logger.warning(f"Rate limited on retry {retry_count+1}. Waiting {self.rate_limit_delay} seconds...")
-                time.sleep(self.rate_limit_delay)
+            elif response.status_code == 429:  # Rate limit
+                logger.warning(f"Rate limited. Waiting before retry.")
+                time.sleep(delay * 5)
                 return self.make_request(url, retry_count + 1)
             else:
                 logger.error(f"Request failed with status code {response.status_code}: {response.text}")
@@ -96,7 +92,7 @@ class OxHourlyCollector:
                 return None
                 
         except Exception as e:
-            logger.error(f"Request error on retry {retry_count+1}: {str(e)}")
+            logger.error(f"Request error: {str(e)}")
             if retry_count < self.max_retries - 1:
                 time.sleep(self.base_delay * (2 ** retry_count))
                 return self.make_request(url, retry_count + 1)
@@ -116,106 +112,37 @@ class OxHourlyCollector:
         markets_data = response['data']
         logger.info(f"Found {len(markets_data)} markets")
         
-        # Return just the market codes
-        return [m['marketCode'] for m in markets_data if 'marketCode' in m]
+        # Filter for futures markets
+        futures_markets = [m['marketCode'] for m in markets_data if 'marketCode' in m and '-SWAP-LIN' in m['marketCode']]
+        logger.info(f"Found {len(futures_markets)} futures markets")
+        
+        return futures_markets
     
-    def get_mark_price(self, market_code):
-        """Get the mark price for a market"""
-        # Try different approaches to get the price
-        
-        # Try approach 1: Get latest trades
-        url = f'https://api.ox.fun/v3/trades?marketCode={market_code}&limit=1'
-        
-        response = self.make_request(url)
-        
-        if response and 'success' in response and response['success'] and 'data' in response:
-            try:
-                trades_data = response['data']
-                if isinstance(trades_data, list) and len(trades_data) > 0:
-                    trade = trades_data[0]
-                    if 'price' in trade and trade['price'] is not None:
-                        price = float(trade['price'])
-                        logger.info(f"Got price for {market_code}: {price} (from latest trade)")
-                        return price
-            except (TypeError, ValueError, IndexError) as e:
-                logger.error(f"Error extracting price from trade data: {str(e)}")
-        
-        # Try approach 2: Get orderbook
-        url = f'https://api.ox.fun/v3/orderbook?marketCode={market_code}&depth=1'
-        
-        response = self.make_request(url)
-        
-        if response and 'success' in response and response['success'] and 'data' in response:
-            try:
-                orderbook = response['data']
-                if 'asks' in orderbook and isinstance(orderbook['asks'], list) and len(orderbook['asks']) > 0:
-                    ask_price = float(orderbook['asks'][0][0])  # First ask price
-                    logger.info(f"Got ask price for {market_code}: {ask_price}")
-                    return ask_price
-                elif 'bids' in orderbook and isinstance(orderbook['bids'], list) and len(orderbook['bids']) > 0:
-                    bid_price = float(orderbook['bids'][0][0])  # First bid price
-                    logger.info(f"Got bid price for {market_code}: {bid_price}")
-                    return bid_price
-            except (TypeError, ValueError, IndexError) as e:
-                logger.error(f"Error extracting price from orderbook data: {str(e)}")
-        
-        # Try approach 3: Get market statistics
-        url = f'https://api.ox.fun/v3/market-statistics?marketCode={market_code}'
-        
-        response = self.make_request(url)
-        
-        if response and 'success' in response and response['success'] and 'data' in response:
-            try:
-                stats = response['data']
-                if isinstance(stats, list) and len(stats) > 0:
-                    stat = stats[0]
-                    for field in ['last', 'close', 'markPrice', 'indexPrice']:
-                        if field in stat and stat[field] is not None:
-                            price = float(stat[field])
-                            logger.info(f"Got price for {market_code}: {price} (from market statistics, field: {field})")
-                            return price
-            except (TypeError, ValueError, IndexError) as e:
-                logger.error(f"Error extracting price from market statistics: {str(e)}")
-        
-        logger.warning(f"Could not get current price for {market_code}")
-        return None
-    
-    def fetch_and_store_data(self, market_code):
-        """Fetch funding rate and mark price and store them together"""
-        # Get funding rate
+    def fetch_and_store_funding_rate(self, market_code):
+        """Fetch the latest funding rate for a market"""
         url = f'https://api.ox.fun/v3/funding/rates?marketCode={market_code}&limit=1'
         
-        funding_response = self.make_request(url)
+        response = self.make_request(url)
         
-        if not funding_response or 'success' not in funding_response or not funding_response['success']:
+        if not response or 'success' not in response or not response['success']:
             logger.error(f"Failed to fetch funding rate for {market_code}")
-            return None
+            return False
         
-        if 'data' not in funding_response or not isinstance(funding_response['data'], list) or len(funding_response['data']) == 0:
+        if 'data' not in response or not isinstance(response['data'], list) or len(response['data']) == 0:
             logger.warning(f"No funding rate data for {market_code}")
-            return None
+            return False
             
-        funding_data = funding_response['data'][0]
+        funding_data = response['data'][0]
         funding_rate = float(funding_data.get('fundingRate', 0))
         created_at = funding_data.get('createdAt', '')
         
-        # Get mark price
-        mark_price = self.get_mark_price(market_code)
+        logger.info(f"Fetched funding rate for {market_code}: {funding_rate}")
         
-        logger.info(f"Fetched latest funding rate for {market_code}: {funding_rate}, price: {mark_price}")
-        
-        # Store the data
-        self.store_data(market_code, funding_rate, mark_price, created_at)
-        
-        return {
-            'market_code': market_code,
-            'funding_rate': funding_rate,
-            'mark_price': mark_price,
-            'created_at': created_at
-        }
+        # Store the funding rate
+        return self.store_funding_rate(market_code, funding_rate, created_at)
     
-    def store_data(self, market_code, funding_rate, mark_price, created_at):
-        """Store funding rate and mark price in the database"""
+    def store_funding_rate(self, market_code, funding_rate, created_at):
+        """Store a funding rate in the database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -228,29 +155,34 @@ class OxHourlyCollector:
                     timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
                 except (ValueError, OSError):
                     logger.warning(f"Invalid timestamp: {created_at}, using current time")
-                    timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    timestamp_str = collection_time
             else:
-                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                timestamp_str = collection_time
             
             cursor.execute('''
             INSERT OR IGNORE INTO funding_rates
-            (market_code, funding_rate, mark_price, created_at, timestamp, collection_time)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', (market_code, funding_rate, mark_price, created_at, timestamp_str, collection_time))
+            (market_code, funding_rate, created_at, timestamp, collection_time)
+            VALUES (?, ?, ?, ?, ?)
+            ''', (market_code, funding_rate, created_at, timestamp_str, collection_time))
             
-            if cursor.rowcount > 0:
-                logger.info(f"Inserted new funding rate with price for {market_code}")
+            success = cursor.rowcount > 0
+            if success:
+                logger.info(f"Inserted new funding rate for {market_code}")
             else:
                 logger.info(f"Funding rate for {market_code} already exists")
-        
+            
+            conn.commit()
+            conn.close()
+            return success
+            
         except Exception as e:
             logger.error(f"Error storing funding rate: {str(e)}")
-        
-        conn.commit()
-        conn.close()
+            conn.rollback()
+            conn.close()
+            return False
     
     def export_to_csv(self, collection_time):
-        """Export the latest data to CSV files with datetime in filename"""
+        """Export the latest data to CSV files"""
         time_str = collection_time.strftime('%Y%m%d_%H%M%S')
         
         # Create dated directories
@@ -260,99 +192,96 @@ class OxHourlyCollector:
         try:
             conn = sqlite3.connect(self.db_path)
             
-            # Export data
+            # Export funding rates for this collection
             query = f"""
-                SELECT market_code, funding_rate, mark_price, timestamp, collection_time 
+                SELECT market_code, funding_rate, timestamp, collection_time 
                 FROM funding_rates 
                 WHERE date(collection_time) = date('{collection_time.strftime('%Y-%m-%d')}')
                 ORDER BY market_code
             """
             
-            file_path = os.path.join(dated_dir, f"ox_data_{time_str}.csv")
-            data_df = pd.read_sql_query(query, conn)
-            data_df.to_csv(file_path, index=False)
-            logger.info(f"Exported {len(data_df)} records to {file_path}")
+            file_path = os.path.join(dated_dir, f"ox_funding_rates_{time_str}.csv")
+            funding_df = pd.read_sql_query(query, conn)
+            funding_df.to_csv(file_path, index=False)
+            logger.info(f"Exported {len(funding_df)} funding rates to {file_path}")
             
-            # Create or update a consolidated CSV for the day
-            self.update_consolidated_file(collection_time, data_df, dated_dir)
+            # Create or update consolidated file for the day
+            consolidated_file = os.path.join(dated_dir, f"ox_funding_rates_{collection_time.strftime('%Y-%m-%d')}_consolidated.csv")
+            
+            if os.path.exists(consolidated_file):
+                existing_df = pd.read_csv(consolidated_file)
+                # Remove entries for same markets if they exist
+                existing_df = existing_df[~existing_df['market_code'].isin(funding_df['market_code'])]
+                consolidated_df = pd.concat([existing_df, funding_df])
+            else:
+                consolidated_df = funding_df
+                
+            consolidated_df.to_csv(consolidated_file, index=False)
+            logger.info(f"Updated consolidated file with {len(funding_df)} new records")
             
             conn.close()
             
         except Exception as e:
             logger.error(f"Error exporting data to CSV: {str(e)}")
     
-    def update_consolidated_file(self, collection_time, data_df, dated_dir):
-        """Update or create consolidated CSV file for the day"""
-        date_str = collection_time.strftime('%Y-%m-%d')
-        
-        # Consolidated file
-        consolidated_file = os.path.join(dated_dir, f"ox_data_{date_str}_consolidated.csv")
-        if os.path.exists(consolidated_file):
-            existing_data = pd.read_csv(consolidated_file)
-            # Remove entries for same markets if they exist
-            existing_data = existing_data[~existing_data['market_code'].isin(data_df['market_code'])]
-            consolidated_data = pd.concat([existing_data, data_df])
-        else:
-            consolidated_data = data_df
-            
-        consolidated_data.to_csv(consolidated_file, index=False)
-        logger.info(f"Updated consolidated file with {len(data_df)} new records")
-    
-    def collect_data(self):
-        """Collect data for all markets"""
+    def collect_funding_rates(self):
+        """Collect funding rates for all futures markets"""
         collection_time = datetime.now()
-        logger.info(f"Starting data collection at {collection_time}")
+        logger.info(f"Starting funding rate collection at {collection_time}")
         
-        # Fetch all markets
-        all_markets = self.fetch_markets()
-        futures_markets = [m for m in all_markets if '-SWAP-LIN' in m]
+        # Fetch markets
+        futures_markets = self.fetch_markets()
         
-        logger.info(f"Collecting data for {len(futures_markets)} futures markets")
+        if not futures_markets:
+            logger.error("No futures markets found. Aborting collection.")
+            return {
+                'collection_time': collection_time,
+                'markets_processed': 0,
+                'funding_rates_collected': 0
+            }
         
+        # Collect funding rates
         success_count = 0
         
-        # Process each market
         for i, market_code in enumerate(futures_markets):
             logger.info(f"Processing {i+1}/{len(futures_markets)}: {market_code}")
             
             try:
-                # Fetch and store data
-                result = self.fetch_and_store_data(market_code)
-                if result:
+                if self.fetch_and_store_funding_rate(market_code):
                     success_count += 1
                 
-                # Add a small delay to avoid rate limiting
+                # Small delay to avoid rate limiting
                 time.sleep(0.5)
                 
             except Exception as e:
                 logger.error(f"Error processing {market_code}: {str(e)}")
         
-        logger.info(f"Data collection complete. Successfully processed {success_count} markets")
+        logger.info(f"Collection complete. Collected {success_count} funding rates.")
         
-        # Export data to CSV
+        # Export to CSV
         self.export_to_csv(collection_time)
         
         return {
             'collection_time': collection_time,
             'markets_processed': len(futures_markets),
-            'success_count': success_count
+            'funding_rates_collected': success_count
         }
 
 # Main execution
 if __name__ == "__main__":
-    logger.info("Starting OX Hourly Data Collector")
+    logger.info("Starting OX Funding Rate Collector")
     
     # Check for API credentials
     if API_KEY == "your_api_key" or SECRET_KEY == "your_secret_key":
         logger.error("API credentials not configured. Please set OX_API_KEY and OX_SECRET_KEY environment variables.")
         exit(1)
     
-    collector = OxHourlyCollector()
-    results = collector.collect_data()
+    collector = OxFundingCollector()
+    results = collector.collect_funding_rates()
     
     logger.info("Collection Summary:")
     logger.info(f"Collection time: {results['collection_time']}")
     logger.info(f"Markets processed: {results['markets_processed']}")
-    logger.info(f"Successfully processed: {results['success_count']}")
+    logger.info(f"Funding rates collected: {results['funding_rates_collected']}")
     
-    logger.info("OX Hourly Data Collector completed successfully")
+    logger.info("OX Funding Rate Collector completed successfully")
