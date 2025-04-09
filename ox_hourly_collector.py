@@ -1,4 +1,37 @@
-import requests
+def enforce_rate_limit(self):
+        """Enforce the rate limit of requests_per_minute"""
+        current_time = time.time()
+        
+        # Remove timestamps older than 1 minute
+        one_minute_ago = current_time - 60
+        self.request_timestamps = [t for t in self.request_timestamps if t > one_minute_ago]
+        
+        # If we've made too many requests in the last minute, wait
+        if len(self.request_timestamps) >= self.requests_per_minute:
+            # Calculate how long to wait for the oldest request to expire from the window
+            oldest_timestamp = min(self.request_timestamps)
+            wait_time = oldest_timestamp + 60 - current_time + 0.1  # Add a small buffer
+            
+            logger.warning(f"Rate limit window full ({len(self.request_timestamps)} requests in last minute). Waiting {wait_time:.2f}s")
+            time.sleep(wait_time)
+            
+            # Update current time and clean list again
+            current_time = time.time()
+            one_minute_ago = current_time - 60
+            self.request_timestamps = [t for t in self.request_timestamps if t > one_minute_ago]
+        
+        # Calculate minimum wait time based on last request
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.request_interval:
+            wait_time = self.request_interval - time_since_last_request
+            logger.debug(f"Waiting {wait_time:.2f}s to maintain request interval")
+            time.sleep(wait_time)
+        
+        # Update tracking
+        self.last_request_time = time.time()
+        self.request_timestamps.append(self.last_request_time)
+        
+        return self.last_request_timeimport requests
 import time
 import pandas as pd
 from datetime import datetime
@@ -41,19 +74,34 @@ class OxFundingCollector:
             'X-SECRET-KEY': self.secret_key
         }
         
-        # Improved rate limiting configuration
-        self.base_delay = 2.0  # Increased initial delay
-        self.max_retries = 5   # Increased max retries
-        self.backoff_factor = 2.0  # Exponential backoff factor
-        self.jitter = 0.3  # Random jitter to add variation to retry timing
+        # Rate limiting configuration based on API documentation
+        self.requests_per_minute = 20  # OX API limit for funding rates
+        self.request_interval = 60.0 / self.requests_per_minute  # Time between requests (3 seconds)
+        self.safety_factor = 1.2  # Additional buffer to stay within limits
+        
+        # Apply safety factor to be conservative
+        self.request_interval *= self.safety_factor  # ~3.6 seconds between requests
+        
+        # Retry configuration
+        self.max_retries = 5
+        self.backoff_factor = 2.5
+        self.jitter = 0.3
         
         # Counters for rate limit tracking
         self.rate_limit_hits = 0
         self.consecutive_rate_limits = 0
-        self.max_rate_limit_pause = 120  # Maximum pause in seconds
+        self.max_rate_limit_pause = 300  # Maximum pause in seconds (5 minutes)
+        
+        # Rate limiting strategy
+        self.batch_size = 15  # Process 15 markets per batch (~54 seconds at 3.6s per request)
+        self.batch_interval = 6.0  # Additional seconds to wait between batches
+        self.last_request_time = 0
+        self.request_timestamps = []  # Track timestamps of requests for rate limiting
         
         # Initialize database
         self.init_database()
+        
+        logger.info(f"Rate limit configuration: {self.requests_per_minute} requests/min = {self.request_interval:.2f}s between requests")
     
     def init_database(self):
         """Initialize SQLite database with funding rates table"""
@@ -89,39 +137,64 @@ class OxFundingCollector:
     
     def calculate_backoff_delay(self, retry_count):
         """Calculate backoff delay with jitter"""
-        delay = self.base_delay * (self.backoff_factor ** retry_count)
+        # Start with longer base delay for retries
+        base_retry_delay = self.request_interval * 2
+        delay = base_retry_delay * (self.backoff_factor ** retry_count)
         # Add jitter to avoid thundering herd problem
         jitter_amount = delay * self.jitter
         delay += random.uniform(-jitter_amount, jitter_amount)
-        return max(self.base_delay, delay)  # Ensure at least base delay
+        return max(base_retry_delay, delay)  # Ensure at least base delay
     
     def adaptive_rate_limit_pause(self):
         """Implement adaptive pausing when hitting rate limits frequently"""
         self.consecutive_rate_limits += 1
+        self.rate_limit_hits += 1
         
-        # If we've hit multiple rate limits in a row, take a longer pause
-        if self.consecutive_rate_limits > 2:
-            pause_time = min(
-                10 * (2 ** (self.consecutive_rate_limits - 2)), 
-                self.max_rate_limit_pause
-            )
-            logger.warning(f"Multiple consecutive rate limits detected. Pausing for {pause_time} seconds")
+        # Take a substantial break after every few rate limits
+        if self.rate_limit_hits % 3 == 0:
+            # Take a very long break after every 3rd rate limit
+            pause_time = 180 + random.uniform(30, 60)  # 3-4 minutes
+            logger.warning(f"Rate limit threshold reached ({self.rate_limit_hits} total). Taking an extended break for {pause_time:.1f} seconds")
             time.sleep(pause_time)
             return True
-        return False
+        
+        # If we've hit multiple rate limits in a row, take a longer pause
+        if self.consecutive_rate_limits > 1:
+            pause_time = min(
+                30 * (2 ** (self.consecutive_rate_limits - 1)), 
+                self.max_rate_limit_pause
+            )
+            logger.warning(f"Multiple consecutive rate limits detected ({self.consecutive_rate_limits}). Pausing for {pause_time:.1f} seconds")
+            time.sleep(pause_time)
+            return True
+            
+        # Even for the first rate limit, take a substantial pause
+        pause_time = 45 + random.uniform(5, 15)
+        logger.warning(f"Rate limit detected. Pausing for {pause_time:.1f} seconds")
+        time.sleep(pause_time)
+        return True
     
     def make_request(self, url, retry_count=0):
-        """Make API request with improved retry logic and adaptive rate limiting"""
+        """Make API request with improved retry logic and strict rate limiting"""
         if retry_count >= self.max_retries:
             logger.warning(f"Max retries ({self.max_retries}) exceeded for URL: {url}")
             return None
         
         try:
-            # Apply delay for all requests except the first one
+            # Always enforce rate limiting before making a request
+            self.enforce_rate_limit()
+            
+            # Apply delay for retries
             if retry_count > 0:
                 delay = self.calculate_backoff_delay(retry_count)
                 logger.info(f"Retry {retry_count}/{self.max_retries}. Waiting {delay:.2f} seconds before retry.")
                 time.sleep(delay)
+                # Enforce rate limit again after retry delay
+                self.enforce_rate_limit()
+            
+            # Log the current rate limit status
+            if retry_count == 0:
+                logger.debug(f"Making request ({len(self.request_timestamps)}/{self.requests_per_minute} in current window)")
             
             response = requests.get(url, headers=self.headers, timeout=30)
             
@@ -131,20 +204,24 @@ class OxFundingCollector:
                 return response.json()
             elif response.status_code == 429:  # Rate limit
                 self.rate_limit_hits += 1
-                logger.warning(f"Rate limited ({self.rate_limit_hits} total). Waiting before retry.")
+                self.consecutive_rate_limits += 1
+                
+                logger.warning(f"Rate limited ({self.rate_limit_hits} total, {self.consecutive_rate_limits} consecutive)")
                 
                 # Check for rate limit headers
                 retry_after = response.headers.get('Retry-After')
                 if retry_after:
-                    wait_time = int(retry_after) + random.uniform(1, 3)
-                    logger.info(f"Server requested wait time of {retry_after} seconds. Waiting {wait_time} seconds.")
+                    wait_time = int(retry_after) + 5  # Add buffer
+                    logger.info(f"Server requested wait time of {retry_after}s. Waiting {wait_time}s.")
                     time.sleep(wait_time)
                 else:
-                    # Apply adaptive rate limiting
-                    self.adaptive_rate_limit_pause()
-                    delay = self.calculate_backoff_delay(retry_count + 2)  # Higher backoff for rate limits
-                    logger.info(f"No Retry-After header. Waiting {delay:.2f} seconds.")
-                    time.sleep(delay)
+                    # Calculate adaptive wait time - longer for consecutive limits
+                    wait_time = 60 * min(self.consecutive_rate_limits, 5)  # Up to 5 minutes
+                    logger.info(f"No Retry-After header. Waiting {wait_time}s for rate limit to reset.")
+                    time.sleep(wait_time)
+                
+                # Clear the request timestamps after a rate limit
+                self.request_timestamps = []
                 
                 return self.make_request(url, retry_count + 1)
             else:
@@ -396,10 +473,10 @@ class OxFundingCollector:
         return False
     
     def collect_funding_rates(self):
-        """Collect funding rates for all futures markets"""
+        """Collect funding rates for all futures markets with strict rate limiting"""
         collection_time = datetime.now()
         logger.info(f"Starting funding rate collection at {collection_time}")
-        logger.info(f"Using base delay of {self.base_delay}s with backoff factor {self.backoff_factor} and max retries {self.max_retries}")
+        logger.info(f"Rate limit: {self.requests_per_minute} requests/minute with {self.request_interval:.2f}s between requests")
         
         # Fetch markets
         futures_markets = self.fetch_markets()
@@ -412,48 +489,96 @@ class OxFundingCollector:
                 'funding_rates_collected': 0
             }
         
+        # Calculate approximate time to complete
+        estimated_time_seconds = len(futures_markets) * self.request_interval
+        estimated_time_minutes = estimated_time_seconds / 60
+        logger.info(f"Found {len(futures_markets)} markets. Estimated completion time: {estimated_time_minutes:.1f} minutes")
+        
         # Collect funding rates
         success_count = 0
-        batch_size = 20  # Process in smaller batches with pauses
-        total_batches = (len(futures_markets) + batch_size - 1) // batch_size
+        total_batches = (len(futures_markets) + self.batch_size - 1) // self.batch_size
+        
+        logger.info(f"Processing in {total_batches} batches of {self.batch_size} markets each")
         
         for batch_idx in range(total_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, len(futures_markets))
+            start_idx = batch_idx * self.batch_size
+            end_idx = min((batch_idx + 1) * self.batch_size, len(futures_markets))
             batch = futures_markets[start_idx:end_idx]
             
             logger.info(f"Processing batch {batch_idx+1}/{total_batches} ({start_idx+1}-{end_idx}/{len(futures_markets)})")
             
+            batch_start_time = time.time()
             batch_success = 0
+            
+            # Process each market
             for i, market_code in enumerate(batch):
                 logger.info(f"Processing {start_idx+i+1}/{len(futures_markets)}: {market_code}")
                 
                 try:
-                    # Add small random delay between requests in the same batch
-                    if i > 0:
-                        time.sleep(random.uniform(1.0, 2.0))
-                        
                     if self.fetch_and_store_funding_rate(market_code):
                         success_count += 1
                         batch_success += 1
-                    
+                
                 except Exception as e:
                     logger.error(f"Error processing {market_code}: {str(e)}")
                     self.log_failed_request(market_code, str(e))
             
-            logger.info(f"Batch {batch_idx+1} complete: {batch_success}/{len(batch)} successful")
+            batch_duration = time.time() - batch_start_time
+            logger.info(f"Batch {batch_idx+1} complete: {batch_success}/{len(batch)} successful in {batch_duration:.1f}s")
             
-            # Add a pause between batches if we have more to process
+            # Calculate progress statistics
+            elapsed_time = time.time() - collection_time.timestamp()
+            progress_percent = (batch_idx + 1) / total_batches * 100
+            markets_per_second = (start_idx + len(batch)) / elapsed_time if elapsed_time > 0 else 0
+            
+            # Estimate remaining time
+            markets_remaining = len(futures_markets) - (start_idx + len(batch))
+            estimated_remaining_seconds = markets_remaining / markets_per_second if markets_per_second > 0 else 0
+            estimated_remaining_minutes = estimated_remaining_seconds / 60
+            
+            logger.info(f"Progress: {progress_percent:.1f}% complete. Estimated remaining time: {estimated_remaining_minutes:.1f} minutes")
+            
+            # Add a small pause between batches
             if batch_idx < total_batches - 1:
-                # Longer pause if rate limited a lot in this batch
-                if self.consecutive_rate_limits > 0:
-                    pause_time = min(30 * self.consecutive_rate_limits, 180)
-                    logger.info(f"Rate limited in this batch. Pausing for {pause_time} seconds before next batch")
-                else:
-                    pause_time = random.uniform(5, 15)
-                    logger.info(f"Pausing for {pause_time:.1f} seconds before next batch")
-                    
+                pause_time = self.batch_interval + random.uniform(0, 2)
+                logger.info(f"Pausing for {pause_time:.1f}s before next batch")
                 time.sleep(pause_time)
+                
+                # If we've hit rate limits recently, take a longer break every 5 batches
+                if self.rate_limit_hits > 0 and batch_idx % 5 == 4:
+                    pause_time = 60 + random.uniform(0, 15)  # 1-1.25 minute pause
+                    logger.info(f"Taking an extended break of {pause_time:.1f}s to ensure rate limit recovery")
+                    time.sleep(pause_time)
+                    self.request_timestamps = []  # Reset timestamps for rate limiting
+        
+        logger.info(f"Initial collection complete. Collected {success_count}/{len(futures_markets)} funding rates.")
+        
+        # Retry failed requests
+        failed_count = len(futures_markets) - success_count
+        if failed_count > 0:
+            logger.info(f"Found {failed_count} failed requests. Waiting 2 minutes before retrying...")
+            time.sleep(120)  # 2 minute break
+            self.retry_failed_requests()
+        
+        # Export to CSV
+        self.export_to_csv(collection_time)
+        
+        # Get final count of collected rates
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM funding_rates WHERE date(collection_time) = date('{collection_time.strftime('%Y-%m-%d')}')")
+        final_count = cursor.fetchone()[0]
+        conn.close()
+        
+        logger.info(f"Final collection stats: {final_count}/{len(futures_markets)} funding rates collected")
+        
+        return {
+            'collection_time': collection_time,
+            'markets_processed': len(futures_markets),
+            'funding_rates_collected': final_count,
+            'success_rate': (final_count / len(futures_markets)) * 100 if len(futures_markets) > 0 else 0,
+            'rate_limit_hits': self.rate_limit_hits
+        }
         
         logger.info(f"Initial collection complete. Collected {success_count}/{len(futures_markets)} funding rates.")
         
@@ -496,8 +621,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='OX Funding Rate Collector')
     parser.add_argument('--max-retries', type=int, default=5, help='Maximum number of retries per request')
-    parser.add_argument('--base-delay', type=float, default=2.0, help='Base delay between requests in seconds')
-    parser.add_argument('--backoff-factor', type=float, default=2.0, help='Exponential backoff factor')
+    parser.add_argument('--requests-per-minute', type=int, default=20, help='API rate limit (requests per minute)')
+    parser.add_argument('--safety-factor', type=float, default=1.2, help='Safety factor for rate limit (>1 is more conservative)')
+    parser.add_argument('--batch-size', type=int, default=15, help='Number of markets to process in each batch')
+    parser.add_argument('--batch-interval', type=float, default=6.0, help='Additional seconds to wait between batches')
+    parser.add_argument('--resume-failed', action='store_true', help='Only retry previously failed requests')
     args = parser.parse_args()
     
     # Check for API credentials
@@ -511,10 +639,24 @@ if __name__ == "__main__":
         # Apply command line parameters if provided
         if args.max_retries:
             collector.max_retries = args.max_retries
-        if args.base_delay:
-            collector.base_delay = args.base_delay
-        if args.backoff_factor:
-            collector.backoff_factor = args.backoff_factor
+        if args.requests_per_minute:
+            collector.requests_per_minute = args.requests_per_minute
+            collector.request_interval = 60.0 / collector.requests_per_minute * collector.safety_factor
+            logger.info(f"Set rate limit to {collector.requests_per_minute} requests/minute ({collector.request_interval:.2f}s between requests)")
+        if args.safety_factor:
+            collector.safety_factor = args.safety_factor
+            collector.request_interval = 60.0 / collector.requests_per_minute * collector.safety_factor
+            logger.info(f"Set safety factor to {collector.safety_factor} ({collector.request_interval:.2f}s between requests)")
+        if args.batch_size:
+            collector.batch_size = args.batch_size
+        if args.batch_interval:
+            collector.batch_interval = args.batch_interval
+        
+        # Option to only retry failed requests from previous runs
+        if args.resume_failed:
+            logger.info("Only retrying previously failed requests")
+            collector.retry_failed_requests()
+            sys.exit(0)
         
         results = collector.collect_funding_rates()
         
@@ -537,4 +679,4 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         logger.critical(f"Unexpected error: {str(e)}")
-        sys.exit(1)
+        sys.exit(1))
