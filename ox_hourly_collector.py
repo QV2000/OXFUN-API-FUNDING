@@ -75,28 +75,11 @@ class OxHourlyCollector:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             market_code TEXT,
             funding_rate REAL,
+            price REAL,
             created_at TEXT,
             timestamp DATETIME,
             collection_time DATETIME,
             UNIQUE(market_code, created_at)
-        )
-        ''')
-        
-        # OHLC candles table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS candles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            market_code TEXT,
-            timeframe TEXT,
-            timestamp DATETIME,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL,
-            volume REAL,
-            time_ms TEXT,
-            collection_time DATETIME,
-            UNIQUE(market_code, timeframe, time_ms)
         )
         ''')
         
@@ -179,8 +162,30 @@ class OxHourlyCollector:
         # Return just the market codes
         return [m['marketCode'] for m in markets_data if 'marketCode' in m]
     
-    def fetch_latest_funding_rate(self, market_code):
-        """Fetch only the latest funding rate for a market"""
+    def get_current_price(self, market_code):
+        """Get the current price for a market using the 60s candle"""
+        # Try different timeframes in order of preference
+        timeframes = ["60s", "300s", "900s"]
+        
+        for timeframe in timeframes:
+            url = f'https://api.ox.fun/v3/candles?marketCode={market_code}&timeframe={timeframe}&limit=1'
+            
+            response = self.make_request(url)
+            
+            if response and 'success' in response and response['success'] and 'data' in response:
+                if isinstance(response['data'], list) and len(response['data']) > 0:
+                    candle = response['data'][0]
+                    # Get the closing price as the current price
+                    if 'close' in candle:
+                        price = self.safe_float(candle, 'close', 0)
+                        logger.info(f"Got current price for {market_code}: {price} (using {timeframe} timeframe)")
+                        return price
+        
+        logger.warning(f"Could not get current price for {market_code}")
+        return None
+    
+    def fetch_and_store_funding_with_price(self, market_code):
+        """Fetch the latest funding rate and current price together"""
         url = f'https://api.ox.fun/v3/funding/rates?marketCode={market_code}&limit=1'
         
         response = self.make_request(url)
@@ -194,25 +199,30 @@ class OxHourlyCollector:
             return None
             
         latest_rate = response['data'][0]
-        logger.info(f"Fetched latest funding rate for {market_code}: {latest_rate.get('fundingRate', 'N/A')}")
+        funding_rate = float(latest_rate.get('fundingRate', 0))
+        created_at = latest_rate.get('createdAt', '')
         
-        # Store the funding rate
-        self.store_funding_rate(latest_rate)
+        # Get the current price
+        price = self.get_current_price(market_code)
         
-        return latest_rate
+        logger.info(f"Fetched latest funding rate for {market_code}: {funding_rate}, price: {price}")
+        
+        # Store the funding rate and price together
+        self.store_funding_with_price(market_code, funding_rate, price, created_at)
+        
+        return {
+            'market_code': market_code,
+            'funding_rate': funding_rate,
+            'price': price,
+            'created_at': created_at
+        }
     
-    def store_funding_rate(self, entry):
-        """Store a single funding rate entry in the database"""
-        if not entry:
-            return
-        
+    def store_funding_with_price(self, market_code, funding_rate, price, created_at):
+        """Store a funding rate with its price in the database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
-            market_code = entry.get('marketCode', '')
-            funding_rate = float(entry.get('fundingRate', 0))
-            created_at = entry.get('createdAt', '')
             collection_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
             if created_at:
@@ -227,104 +237,17 @@ class OxHourlyCollector:
             
             cursor.execute('''
             INSERT OR IGNORE INTO funding_rates
-            (market_code, funding_rate, created_at, timestamp, collection_time)
-            VALUES (?, ?, ?, ?, ?)
-            ''', (market_code, funding_rate, created_at, timestamp_str, collection_time))
+            (market_code, funding_rate, price, created_at, timestamp, collection_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (market_code, funding_rate, price, created_at, timestamp_str, collection_time))
             
             if cursor.rowcount > 0:
-                logger.info(f"Inserted new funding rate for {market_code}")
+                logger.info(f"Inserted new funding rate with price for {market_code}")
             else:
                 logger.info(f"Funding rate for {market_code} already exists")
         
         except Exception as e:
             logger.error(f"Error storing funding rate: {str(e)}")
-        
-        conn.commit()
-        conn.close()
-    
-    def fetch_latest_candle(self, market_code, timeframe='3600s'):
-        """Fetch only the latest candle for a market and timeframe"""
-        url = f'https://api.ox.fun/v3/candles?marketCode={market_code}&timeframe={timeframe}&limit=1'
-        
-        response = self.make_request(url)
-        
-        if not response or 'success' not in response or not response['success']:
-            logger.error(f"Failed to fetch candle for {market_code}")
-            return None
-        
-        if 'data' not in response or not isinstance(response['data'], list) or len(response['data']) == 0:
-            logger.warning(f"No candle data for {market_code}")
-            return None
-            
-        latest_candle = response['data'][0]
-        logger.info(f"Fetched latest {timeframe} candle for {market_code}")
-        
-        # Store the candle
-        self.store_candle(market_code, timeframe, latest_candle)
-        
-        return latest_candle
-    
-    def store_candle(self, market_code, timeframe, candle):
-        """Store a single candle in the database"""
-        if not candle:
-            return
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            # Identify the timestamp field
-            time_field = None
-            for field in ['openedAt', 'time', 't', 'timestamp', 'closeTime']:
-                if field in candle and candle[field]:
-                    time_field = field
-                    break
-            
-            if not time_field:
-                logger.error(f"Could not identify timestamp field in candle data for {market_code}")
-                return
-                
-            time_ms = str(candle[time_field])
-            collection_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            try:
-                timestamp = datetime.fromtimestamp(int(time_ms) / 1000)
-                timestamp_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-            except (ValueError, TypeError, OSError):
-                logger.warning(f"Invalid timestamp {time_ms}, using current time")
-                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Extract OHLCV data safely
-            open_val = self.safe_float(candle, 'open', 0)
-            high_val = self.safe_float(candle, 'high', 0)
-            low_val = self.safe_float(candle, 'low', 0)
-            close_val = self.safe_float(candle, 'close', 0)
-            volume_val = self.safe_float(candle, 'volume', 0)
-            
-            cursor.execute('''
-            INSERT OR IGNORE INTO candles
-            (market_code, timeframe, timestamp, open, high, low, close, volume, time_ms, collection_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                market_code,
-                timeframe,
-                timestamp_str,
-                open_val,
-                high_val,
-                low_val,
-                close_val,
-                volume_val,
-                time_ms,
-                collection_time
-            ))
-            
-            if cursor.rowcount > 0:
-                logger.info(f"Inserted new candle for {market_code} ({timeframe})")
-            else:
-                logger.info(f"Candle for {market_code} ({timeframe}) already exists")
-        
-        except Exception as e:
-            logger.error(f"Error storing candle: {str(e)}")
         
         conn.commit()
         conn.close()
@@ -349,9 +272,9 @@ class OxHourlyCollector:
         try:
             conn = sqlite3.connect(self.db_path)
             
-            # Export funding rates
+            # Export funding rates with prices
             funding_query = f"""
-                SELECT market_code, funding_rate, timestamp, collection_time 
+                SELECT market_code, funding_rate, price, timestamp, collection_time 
                 FROM funding_rates 
                 WHERE date(collection_time) = date('{collection_time.strftime('%Y-%m-%d')}')
                 ORDER BY market_code
@@ -360,30 +283,17 @@ class OxHourlyCollector:
             funding_file = os.path.join(dated_dir, f"ox_funding_rates_{time_str}.csv")
             funding_df = pd.read_sql_query(funding_query, conn)
             funding_df.to_csv(funding_file, index=False)
-            logger.info(f"Exported {len(funding_df)} funding rates to {funding_file}")
-            
-            # Export candles
-            candles_query = f"""
-                SELECT market_code, timeframe, timestamp, open, high, low, close, volume, collection_time
-                FROM candles 
-                WHERE date(collection_time) = date('{collection_time.strftime('%Y-%m-%d')}')
-                ORDER BY market_code
-            """
-            
-            candles_file = os.path.join(dated_dir, f"ox_candles_{time_str}.csv")
-            candles_df = pd.read_sql_query(candles_query, conn)
-            candles_df.to_csv(candles_file, index=False)
-            logger.info(f"Exported {len(candles_df)} candles to {candles_file}")
+            logger.info(f"Exported {len(funding_df)} funding rates with prices to {funding_file}")
             
             # Create or update a consolidated CSV for the day
-            self.update_consolidated_files(collection_time, funding_df, candles_df, dated_dir)
+            self.update_consolidated_files(collection_time, funding_df, dated_dir)
             
             conn.close()
             
         except Exception as e:
             logger.error(f"Error exporting data to CSV: {str(e)}")
     
-    def update_consolidated_files(self, collection_time, funding_df, candles_df, dated_dir):
+    def update_consolidated_files(self, collection_time, funding_df, dated_dir):
         """Update or create consolidated CSV files for the day"""
         date_str = collection_time.strftime('%Y-%m-%d')
         
@@ -399,24 +309,8 @@ class OxHourlyCollector:
             
         consolidated_funding.to_csv(funding_consolidated, index=False)
         logger.info(f"Updated consolidated funding rates file with {len(funding_df)} new records")
-        
-        # Consolidated candles file
-        candles_consolidated = os.path.join(dated_dir, f"ox_candles_{date_str}_consolidated.csv")
-        if os.path.exists(candles_consolidated):
-            existing_candles = pd.read_csv(candles_consolidated)
-            # Remove entries for same markets if they exist
-            existing_candles = existing_candles[~(
-                (existing_candles['market_code'].isin(candles_df['market_code'])) & 
-                (existing_candles['timeframe'].isin(candles_df['timeframe']))
-            )]
-            consolidated_candles = pd.concat([existing_candles, candles_df])
-        else:
-            consolidated_candles = candles_df
-            
-        consolidated_candles.to_csv(candles_consolidated, index=False)
-        logger.info(f"Updated consolidated candles file with {len(candles_df)} new records")
     
-    def collect_data(self, timeframe='3600s'):
+    def collect_data(self):
         """Collect latest data for all markets"""
         collection_time = datetime.now()
         logger.info(f"Starting data collection at {collection_time}")
@@ -428,22 +322,16 @@ class OxHourlyCollector:
         logger.info(f"Collecting data for {len(futures_markets)} futures markets")
         
         funding_count = 0
-        candle_count = 0
         
         # Process each market
         for i, market_code in enumerate(futures_markets):
             logger.info(f"Processing {i+1}/{len(futures_markets)}: {market_code}")
             
             try:
-                # Fetch funding rate
-                funding_rate = self.fetch_latest_funding_rate(market_code)
-                if funding_rate:
+                # Fetch funding rate with price
+                result = self.fetch_and_store_funding_with_price(market_code)
+                if result:
                     funding_count += 1
-                
-                # Fetch candle
-                candle = self.fetch_latest_candle(market_code, timeframe)
-                if candle:
-                    candle_count += 1
                 
                 # Add a small delay to avoid rate limiting
                 time.sleep(0.5)
@@ -451,7 +339,7 @@ class OxHourlyCollector:
             except Exception as e:
                 logger.error(f"Error processing {market_code}: {str(e)}")
         
-        logger.info(f"Data collection complete. Collected {funding_count} funding rates and {candle_count} candles")
+        logger.info(f"Data collection complete. Collected {funding_count} funding rates with prices")
         
         # Export data to CSV
         self.export_to_csv(collection_time)
@@ -459,8 +347,7 @@ class OxHourlyCollector:
         return {
             'collection_time': collection_time,
             'markets_processed': len(futures_markets),
-            'funding_rates_collected': funding_count,
-            'candles_collected': candle_count
+            'funding_rates_collected': funding_count
         }
 
 # Main execution
@@ -473,12 +360,11 @@ if __name__ == "__main__":
         exit(1)
     
     collector = OxHourlyCollector()
-    results = collector.collect_data(timeframe='3600s')
+    results = collector.collect_data()
     
     logger.info("Collection Summary:")
     logger.info(f"Collection time: {results['collection_time']}")
     logger.info(f"Markets processed: {results['markets_processed']}")
     logger.info(f"Funding rates collected: {results['funding_rates_collected']}")
-    logger.info(f"Candles collected: {results['candles_collected']}")
     
     logger.info("OX Hourly Data Collector completed successfully")
