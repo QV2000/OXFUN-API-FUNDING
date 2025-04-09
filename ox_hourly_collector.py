@@ -163,22 +163,35 @@ class OxHourlyCollector:
         return [m['marketCode'] for m in markets_data if 'marketCode' in m]
     
     def get_current_price(self, market_code):
-        """Get the current price for a market using the 60s candle"""
-        # Try different timeframes in order of preference
-        timeframes = ["60s", "300s", "900s"]
+        """Get the current price for a market using the ticker endpoint"""
+        # Try to get price from the ticker endpoint
+        url = f'https://api.ox.fun/v3/tickers?marketCode={market_code}'
         
-        for timeframe in timeframes:
-            url = f'https://api.ox.fun/v3/candles?marketCode={market_code}&timeframe={timeframe}&limit=1'
-            
-            response = self.make_request(url)
-            
-            if response and 'success' in response and response['success'] and 'data' in response:
-                if isinstance(response['data'], list) and len(response['data']) > 0:
-                    candle = response['data'][0]
-                    # Get the closing price as the current price
-                    if 'close' in candle:
-                        price = self.safe_float(candle, 'close', 0)
-                        logger.info(f"Got current price for {market_code}: {price} (using {timeframe} timeframe)")
+        response = self.make_request(url)
+        
+        if response and 'success' in response and response['success'] and 'data' in response:
+            if isinstance(response['data'], list) and len(response['data']) > 0:
+                ticker = response['data'][0]
+                # Try to get the last price
+                for price_field in ['last', 'lastPrice', 'price', 'close']:
+                    if price_field in ticker:
+                        price = self.safe_float(ticker, price_field, None)
+                        if price is not None:
+                            logger.info(f"Got current price for {market_code}: {price} (from ticker)")
+                            return price
+        
+        # Fallback to market data if ticker doesn't work
+        url = f'https://api.ox.fun/v3/market?marketCode={market_code}'
+        
+        response = self.make_request(url)
+        
+        if response and 'success' in response and response['success'] and 'data' in response:
+            market_data = response['data']
+            for price_field in ['last', 'lastPrice', 'price', 'markPrice']:
+                if price_field in market_data:
+                    price = self.safe_float(market_data, price_field, None)
+                    if price is not None:
+                        logger.info(f"Got current price for {market_code}: {price} (from market data)")
                         return price
         
         logger.warning(f"Could not get current price for {market_code}")
