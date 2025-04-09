@@ -1,9 +1,12 @@
 name: OX Data Hourly Collection
-
 on:
   schedule:
     - cron: '0 * * * *'  # Run once every hour
   workflow_dispatch:     # Allow manual trigger
+
+# Add permissions block here
+permissions:
+  contents: write
 
 jobs:
   collect-data:
@@ -22,7 +25,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install requests pandas
-
+        
     - name: Create data directory
       run: mkdir -p data
         
@@ -38,4 +41,5 @@ jobs:
         git config --local user.name "GitHub Action"
         git add data/
         git commit -m "Update data collection $(date +'%Y-%m-%d %H:%M')" || echo "No changes to commit"
+        # Use GITHUB_TOKEN that has proper permissions now
         git push
