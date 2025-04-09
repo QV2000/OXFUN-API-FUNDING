@@ -120,45 +120,64 @@ class OxHourlyCollector:
         return [m['marketCode'] for m in markets_data if 'marketCode' in m]
     
     def get_mark_price(self, market_code):
-        """Get the mark price for a market using the ticker API"""
-        # Use the ticker endpoint
-        url = f'https://api.ox.fun/v3/ticker?marketCode={market_code}'
+        """Get the mark price for a market"""
+        # Try different approaches to get the price
+        
+        # Try approach 1: Get latest trades
+        url = f'https://api.ox.fun/v3/trades?marketCode={market_code}&limit=1'
         
         response = self.make_request(url)
         
         if response and 'success' in response and response['success'] and 'data' in response:
             try:
-                ticker_data = response['data']
-                if isinstance(ticker_data, list) and len(ticker_data) > 0:
-                    ticker = ticker_data[0]
-                    # Look for mark price or other price field
-                    for field in ['markPrice', 'lastPrice', 'last', 'close']:
-                        if field in ticker and ticker[field] is not None:
-                            price = float(ticker[field])
-                            logger.info(f"Got mark price for {market_code}: {price}")
+                trades_data = response['data']
+                if isinstance(trades_data, list) and len(trades_data) > 0:
+                    trade = trades_data[0]
+                    if 'price' in trade and trade['price'] is not None:
+                        price = float(trade['price'])
+                        logger.info(f"Got price for {market_code}: {price} (from latest trade)")
+                        return price
+            except (TypeError, ValueError, IndexError) as e:
+                logger.error(f"Error extracting price from trade data: {str(e)}")
+        
+        # Try approach 2: Get orderbook
+        url = f'https://api.ox.fun/v3/orderbook?marketCode={market_code}&depth=1'
+        
+        response = self.make_request(url)
+        
+        if response and 'success' in response and response['success'] and 'data' in response:
+            try:
+                orderbook = response['data']
+                if 'asks' in orderbook and isinstance(orderbook['asks'], list) and len(orderbook['asks']) > 0:
+                    ask_price = float(orderbook['asks'][0][0])  # First ask price
+                    logger.info(f"Got ask price for {market_code}: {ask_price}")
+                    return ask_price
+                elif 'bids' in orderbook and isinstance(orderbook['bids'], list) and len(orderbook['bids']) > 0:
+                    bid_price = float(orderbook['bids'][0][0])  # First bid price
+                    logger.info(f"Got bid price for {market_code}: {bid_price}")
+                    return bid_price
+            except (TypeError, ValueError, IndexError) as e:
+                logger.error(f"Error extracting price from orderbook data: {str(e)}")
+        
+        # Try approach 3: Get market statistics
+        url = f'https://api.ox.fun/v3/market-statistics?marketCode={market_code}'
+        
+        response = self.make_request(url)
+        
+        if response and 'success' in response and response['success'] and 'data' in response:
+            try:
+                stats = response['data']
+                if isinstance(stats, list) and len(stats) > 0:
+                    stat = stats[0]
+                    for field in ['last', 'close', 'markPrice', 'indexPrice']:
+                        if field in stat and stat[field] is not None:
+                            price = float(stat[field])
+                            logger.info(f"Got price for {market_code}: {price} (from market statistics, field: {field})")
                             return price
             except (TypeError, ValueError, IndexError) as e:
-                logger.error(f"Error extracting price from ticker data: {str(e)}")
-                
-        logger.warning(f"Could not get mark price for {market_code}, trying alternative endpoint")
+                logger.error(f"Error extracting price from market statistics: {str(e)}")
         
-        # Try alternative endpoint for mark price
-        url = f'https://api.ox.fun/v3/market?marketCode={market_code}'
-        
-        response = self.make_request(url)
-        
-        if response and 'success' in response and response['success'] and 'data' in response:
-            try:
-                market_data = response['data']
-                for field in ['markPrice', 'lastPrice', 'last']:
-                    if field in market_data and market_data[field] is not None:
-                        price = float(market_data[field])
-                        logger.info(f"Got mark price for {market_code}: {price} (from market endpoint)")
-                        return price
-            except (TypeError, ValueError) as e:
-                logger.error(f"Error extracting price from market data: {str(e)}")
-        
-        logger.warning(f"Could not get mark price for {market_code}")
+        logger.warning(f"Could not get current price for {market_code}")
         return None
     
     def fetch_and_store_data(self, market_code):
@@ -183,7 +202,7 @@ class OxHourlyCollector:
         # Get mark price
         mark_price = self.get_mark_price(market_code)
         
-        logger.info(f"Collected data for {market_code}: Funding rate = {funding_rate}, Mark price = {mark_price}")
+        logger.info(f"Fetched latest funding rate for {market_code}: {funding_rate}, price: {mark_price}")
         
         # Store the data
         self.store_data(market_code, funding_rate, mark_price, created_at)
@@ -220,12 +239,12 @@ class OxHourlyCollector:
             ''', (market_code, funding_rate, mark_price, created_at, timestamp_str, collection_time))
             
             if cursor.rowcount > 0:
-                logger.info(f"Inserted new data for {market_code}")
+                logger.info(f"Inserted new funding rate with price for {market_code}")
             else:
-                logger.info(f"Data for {market_code} already exists")
+                logger.info(f"Funding rate for {market_code} already exists")
         
         except Exception as e:
-            logger.error(f"Error storing data: {str(e)}")
+            logger.error(f"Error storing funding rate: {str(e)}")
         
         conn.commit()
         conn.close()
