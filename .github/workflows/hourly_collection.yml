@@ -41,5 +41,5 @@ jobs:
         git config --local user.name "GitHub Action"
         git add data/
         git commit -m "Update data collection $(date +'%Y-%m-%d %H:%M')" || echo "No changes to commit"
-        # Use GITHUB_TOKEN that has proper permissions now
+        git pull --rebase origin main
         git push
